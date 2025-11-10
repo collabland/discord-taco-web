@@ -34,10 +34,10 @@ const SIGNING_CHAIN_ID = parseInt(process.env.SIGNING_CHAIN_ID || String((proces
 const COHORT_ID = parseInt(process.env.COHORT_ID || '1', 10);
 const AA_VERSION = 'mdt';
 
-async function createTacoSmartAccount(
-  publicClient: unknown,
-  provider: ethers.providers.JsonRpcProvider,
-) {
+/**
+ * Fetches TACo cohort configuration - shared by all AA creation functions
+ */
+async function getTacoCohortInfo(provider: ethers.providers.JsonRpcProvider) {
   await initialize();
   const participants = await SigningCoordinatorAgent.getParticipants(
     provider,
@@ -50,32 +50,88 @@ async function createTacoSmartAccount(
     COHORT_ID,
   );
   const signers = participants.map((p) => p.operator as Address).sort();
+  const cohortMultisigAddress = await SigningCoordinatorAgent.getCohortMultisigAddress(
+    provider,
+    TACO_DOMAIN,
+    COHORT_ID,
+    CHAIN_ID,
+  );
 
-  // Get the cohort's actual multisig contract address
-  const cohortMultisigAddress =
-    await SigningCoordinatorAgent.getCohortMultisigAddress(
-      provider,
-      TACO_DOMAIN,
-      COHORT_ID,
-      CHAIN_ID,
-    );
+  return { participants, threshold, signers, cohortMultisigAddress };
+}
 
-  // Create a TACo account using the cohort's multisig address
-  // This satisfies MetaMask's signatory requirement and uses the proper cohort multisig
-  const tacoAccount = createViemTacoAccount(cohortMultisigAddress as Address);
-  console.log(`🎯 Using cohort multisig: ${cohortMultisigAddress}`);
+/**
+ * Creates a MetaMask smart account using TACo cohort configuration
+ */
+async function createMetaMaskSmartAccountWithTaco(
+  publicClient: unknown,
+  signers: Address[],
+  threshold: number,
+  cohortMultisigAddress: Address,
+  deploySalt: `0x${string}`,
+) {
+  const tacoAccount = createViemTacoAccount(cohortMultisigAddress);
 
-  // Type mismatch between viem client and delegation-toolkit expected client.
   // @ts-expect-error Incompatible viem Client type; safe at runtime for this demo
   const smartAccount = await toMetaMaskSmartAccount({
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     client: publicClient as any,
     implementation: Implementation.MultiSig,
     deployParams: [signers, BigInt(threshold)],
-    deploySalt: '0x' as `0x${string}`,
+    deploySalt,
     signatory: [{ account: tacoAccount }],
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } as unknown as any);
+
+  return smartAccount;
+}
+
+/**
+ * Derives deterministic AA address for a Discord user.
+ * Uses Collab.Land ID scheme: keccak256("SALT:BOT_APP_ID:DISCORD_USER_ID")
+ */
+async function deriveDiscordUserAA(
+  publicClient: unknown,
+  provider: ethers.providers.JsonRpcProvider,
+  discordUserId: string,
+  botApplicationId: string,
+): Promise<Address> {
+  const { signers, threshold, cohortMultisigAddress } = await getTacoCohortInfo(provider);
+
+  // Compute Collab.Land ID as deploySalt for deterministic address
+  const salt = process.env.SALT;
+  if (!salt) {
+    throw new Error('Missing SALT environment variable');
+  }
+  const collablandId = ethers.utils.keccak256(
+    ethers.utils.toUtf8Bytes(`${salt}:${botApplicationId}:${discordUserId}`)
+  ) as `0x${string}`;
+
+  const smartAccount = await createMetaMaskSmartAccountWithTaco(
+    publicClient,
+    signers,
+    threshold,
+    cohortMultisigAddress as Address,
+    collablandId,
+  );
+
+  return smartAccount.address;
+}
+
+async function createTacoSmartAccount(
+  publicClient: unknown,
+  provider: ethers.providers.JsonRpcProvider,
+) {
+  const { signers, threshold, cohortMultisigAddress } = await getTacoCohortInfo(provider);
+  console.log(`🎯 Using cohort multisig: ${cohortMultisigAddress}`);
+
+  const smartAccount = await createMetaMaskSmartAccountWithTaco(
+    publicClient,
+    signers,
+    threshold,
+    cohortMultisigAddress as Address,
+    '0x' as `0x${string}`,
+  );
 
   return { smartAccount, threshold };
 }
@@ -155,37 +211,50 @@ async function main() {
       await logBalances(provider, localAccount.address, smartAccount.address);
     }
 
-    // Derive tip parameters from Discord payload if available to guarantee match
-    let tipRecipient: Address = (process.env.TIP_RECIPIENT as Address) || (localAccount.address as Address);
-    // Amount is provided in ETH (string) via env or Discord; parse to wei
+    // Derive tip recipient's AA address from their Discord user ID
+    let tipRecipient: Address;
     let transferAmount = ethers.utils.parseEther(process.env.TIP_AMOUNT_ETH || '0.0001');
-    try {
-      const rawDiscord = process.env.CONTEXT_DISCORD_PAYLOAD;
-      if (rawDiscord) {
-        const parsed = JSON.parse(rawDiscord);
-        const opts = parsed?.data?.options || [];
-        const amtOpt = opts.find((o: any) => o?.name === 'amount');
-        const rcptOpt = opts.find((o: any) => o?.name === 'recipient');
-        if (amtOpt?.value != null) transferAmount = ethers.utils.parseEther(String(amtOpt.value));
-        if (rcptOpt?.value) tipRecipient = rcptOpt.value as Address;
-      }
-    } catch {
-      // ignore parse errors and keep env/defaults
+
+    const recipientUserId = process.env.TIP_RECIPIENT_USER_ID;
+    if (!recipientUserId) {
+      throw new Error('Missing TIP_RECIPIENT_USER_ID - must provide Discord user ID');
     }
 
+    // Extract bot application ID from Discord payload
+    const rawDiscord = process.env.CONTEXT_DISCORD_PAYLOAD;
+    if (!rawDiscord) {
+      throw new Error('Missing CONTEXT_DISCORD_PAYLOAD');
+    }
+
+    const parsed = JSON.parse(rawDiscord);
+    const botApplicationId = String(parsed?.application_id || '');
+    if (!botApplicationId) {
+      throw new Error('Missing application_id in Discord payload');
+    }
+
+    // Parse amount from payload
+    const opts = parsed?.data?.options || [];
+    const amtOpt = opts.find((o: any) => o?.name === 'amount');
+    if (amtOpt?.value != null) {
+      transferAmount = ethers.utils.parseEther(String(amtOpt.value));
+    }
+
+    console.log(`🔍 Deriving AA address for Discord user ${recipientUserId}...`);
+    tipRecipient = await deriveDiscordUserAA(
+      publicClient,
+      provider,
+      recipientUserId,
+      botApplicationId,
+    );
+    console.log(`✅ Recipient AA address: ${tipRecipient}\n`);
+
     console.log('📝 Building user operation (via bundler prepare)...');
+    console.log(`💸 Transfer amount: ${ethers.utils.formatEther(transferAmount)} ETH\n`);
+
     // Gas limits to pass to prepare; keep as bigint
     const callGasLimit = 300_000n;
     const verificationGasLimit = 1_000_000n;
     const preVerificationGas = 60_000n;
-    const calls = [
-      {
-        target: tipRecipient,
-          value: BigInt(transferAmount.toString()),
-          data: '0x' as `0x${string}`,
-        },
-    ];
-    console.log(`💸 Transfer amount: ${ethers.utils.formatEther(transferAmount)} ETH\n`);
 
     // Let the smart account/bundler assemble a canonical UserOperation (fixes nonce, entrypoint, format)
     const prepared = await bundlerClient.prepareUserOperation({
@@ -533,7 +602,6 @@ async function main() {
   const discordBody = process.env.CONTEXT_DISCORD_PAYLOAD;
   const discordMessageHexRaw = process.env.CONTEXT_MESSAGE_HEX;
   const discordSignatureRaw = process.env.CONTEXT_SIGNATURE_HEX;
-  const collablandIdFromEnv = process.env.CONTEXT_COLLABLAND_ID as `0x${string}` | undefined;
   if (!discordBody || !discordMessageHexRaw || !discordSignatureRaw) {
     throw new Error('Missing Discord context: require CONTEXT_MESSAGE_HEX, CONTEXT_SIGNATURE_HEX, CONTEXT_DISCORD_PAYLOAD');
   }
@@ -542,26 +610,12 @@ async function main() {
     : (`0x${discordMessageHexRaw}` as `0x${string}`);
   const discordSignatureNo0x = discordSignatureRaw.replace(/^0x/, '');
 
-  // Optionally compute Collab.Land ID from payload if not provided by interactions server
-  let computedCollablandId: `0x${string}` | undefined;
-  try {
-    if (!collablandIdFromEnv && process.env.SALT && discordBody) {
-      const parsed = JSON.parse(discordBody);
-      const botId = String(parsed?.application_id || '');
-      const userId = String((parsed?.member && parsed?.member?.user && parsed?.member?.user?.id) || parsed?.user?.id || '');
-      if (botId && userId) {
-        computedCollablandId = ethers.utils.keccak256(
-          ethers.utils.toUtf8Bytes(`${process.env.SALT}:${botId}:${userId}`)
-        ) as `0x${string}`;
-      }
-    }
-  } catch {}
-
+  // TACo will derive the Collab.Land ID from the Discord payload itself
+  // This ensures the decentralized network verifies the correct recipient
   let signingContextRaw: Record<string, CustomContextParam> = {
     ':message': discordMessageHex as `0x${string}`,
     ':signature': discordSignatureNo0x,
     ':discordPayload': discordBody,
-    ...(collablandIdFromEnv || computedCollablandId ? { ':collablandId': (collablandIdFromEnv || computedCollablandId) as `0x${string}` } : {}),
   };
   try {
     const ctx = await conditions.context.ConditionContext.forSigningCohort(
@@ -602,10 +656,7 @@ async function main() {
       additions[':discordPayload'] = discordBody;
       console.log('🧩 Context :discordPayload: <raw from interactions>');
     }
-    if (requestedParams.includes(':collablandId') && (collablandIdFromEnv || computedCollablandId)) {
-      additions[':collablandId'] = (collablandIdFromEnv || computedCollablandId) as `0x${string}`;
-      console.log('🧩 Context :collablandId:', String(collablandIdFromEnv || computedCollablandId).slice(0, 12) + '...');
-    }
+    // :collablandId removed - TACo will derive it from :discordPayload
     if (Object.keys(additions).length > 0) {
       ctx.addCustomContextParameterValues(additions);
     }

@@ -35,6 +35,12 @@ importers:
       '@nucypher/nucypher-core':
         specifier: ^0.14.5
         version: 0.14.5
+      '@nucypher/shared':
+        specifier: workspace:^0.6.0-alpha.2
+        version: link:packages/shared
+      '@nucypher/taco':
+        specifier: workspace:^0.7.0-alpha.3
+        version: link:packages/taco
       deep-equal:
         specifier: ^2.2.3
         version: 2.2.3
@@ -262,6 +268,9 @@ importers:
       '@nucypher/nucypher-contracts':
         specifier: 0.26.0-alpha.1
         version: 0.26.0-alpha.1
+      '@nucypher/nucypher-core':
+        specifier: ^0.14.5
+        version: 0.14.5
       '@nucypher/shared':
         specifier: workspace:^0.6.0-alpha.2
         version: link:../../packages/shared

@@ -348,8 +348,40 @@ export class PorterClient {
     signingRequests: Record<string, string>,
     threshold: number,
   ): Promise<TacoSignResult> {
+    // Some Porter instances (e.g., lynx) require 'encrypted_signing_requests' with ETSR header.
+    // We construct an ETSR-wrapped payload by prefixing a header:
+    //   magic: 'ETSR' (4 bytes), major: 0x0001 (u16 BE), minor: 0x0000 (u16 BE),
+    // followed by the original payload bytes (no encryption; compatibility shim).
+    // Note: This is a compatibility shim; if Porter enforces actual encryption, a real ETSR
+    //       construction will be required in the upstream library.
+    const makeEtsr = (b64: string): string => {
+      try {
+        const raw = fromBase64(b64);
+        const magic = new TextEncoder().encode('ETSR'); // [69,84,83,82]
+        const version = new Uint8Array(4);
+        // major=1, minor=0 (big-endian)
+        version[0] = 0x00;
+        version[1] = 0x01;
+        version[2] = 0x00;
+        version[3] = 0x00;
+        const header = new Uint8Array(magic.length + version.length);
+        header.set(magic, 0);
+        header.set(version, magic.length);
+        const combined = new Uint8Array(header.length + raw.length);
+        combined.set(header, 0);
+        combined.set(raw, header.length);
+        return toBase64(combined);
+      } catch {
+        return b64;
+      }
+    };
+    const encryptedSigningRequests: Record<string, string> = Object.fromEntries(
+      Object.entries(signingRequests).map(([k, v]) => [k, makeEtsr(v)]),
+    );
+
     const data: Record<string, unknown> = {
       signing_requests: signingRequests,
+      encrypted_signing_requests: encryptedSigningRequests,
       threshold: threshold,
     };
 

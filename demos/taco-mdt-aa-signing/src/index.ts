@@ -49,7 +49,16 @@ async function getTacoCohortInfo(provider: ethers.providers.JsonRpcProvider) {
     TACO_DOMAIN,
     COHORT_ID,
   );
-  const signers = participants.map((p) => p.operator as Address).sort();
+  // Back-compat: newer cohorts expose `signerAddress`, older ones used `operator`
+  const signers = participants
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    .map((p: any) => (p?.signerAddress ?? p?.operator) as string | undefined)
+    .filter((a): a is string => typeof a === 'string' && /^0x[0-9a-fA-F]{40}$/.test(a))
+    .map((a) => a as Address)
+    .sort();
+  if (signers.length === 0) {
+    throw new Error('No valid signer addresses discovered from cohort participants');
+  }
   const cohortMultisigAddress = await SigningCoordinatorAgent.getCohortMultisigAddress(
     provider,
     TACO_DOMAIN,
@@ -362,10 +371,25 @@ async function main() {
           `amount mismatch (discordETH=${String(amountOpt)} callETH=${ethers.utils.formatEther(transferAmount)})`,
         );
       }
-      if (String(tipRecipient).toLowerCase() !== String(recipientOpt || '').toLowerCase()) {
-        throw new Error(
-          `recipient mismatch (discord=${String(recipientOpt)} call=${String(tipRecipient)})`,
-        );
+      // Recipient option is now a Discord User (snowflake). Accept either:
+      // - An on-chain address (legacy) OR
+      // - A Discord user id matching the env-driven TIP_RECIPIENT_USER_ID (current)
+      const recipientStr = String(recipientOpt || '');
+      const isHexAddress = /^0x[0-9a-fA-F]{40}$/.test(recipientStr);
+      if (isHexAddress) {
+        if (String(tipRecipient).toLowerCase() !== recipientStr.toLowerCase()) {
+          throw new Error(
+            `recipient mismatch (discord=${recipientStr} call=${String(tipRecipient)})`,
+          );
+        }
+      } else {
+        const fromEnvUserId = process.env.TIP_RECIPIENT_USER_ID || '';
+        if (recipientStr !== fromEnvUserId) {
+          throw new Error(
+            `recipient mismatch (discordUserId=${recipientStr} envUserId=${fromEnvUserId})`,
+          );
+        }
+        // Address equivalence is enforced trustlessly by TACo via :discordPayload
       }
     } catch (e) {
       throw new Error(
@@ -692,7 +716,7 @@ async function main() {
       userOpShell,
       AA_VERSION,
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      signingContextRaw as any,
+      signingContextRaw as any
     );
     } catch (e) {
       // Extra diagnostics to locate source of failure
